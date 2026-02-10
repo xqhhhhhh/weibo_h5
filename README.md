@@ -1,8 +1,9 @@
-# 微博关键词爬虫（API 串行版 + 验证码自动识别）
+# 微博关键词爬虫（多账号 + 验证码自动处理）
 
-核心脚本：`weibo_bulk_api.py`
-
-当前版本包含完整的验证码自动识别功能，支持视觉识别和JS逆向两种方式。
+核心脚本：
+- `weibo_bulk_api.py`：批量抓关键词结果，支持断点续跑、并发与分片。
+- `captcha_server.py`：本地滑块识别服务（给 Chrome 扩展调用）。
+- `extension/`：Chrome 扩展，自动识别/拖动验证码。
 
 ## 安装
 
@@ -11,147 +12,119 @@ cd 微博h5
 python3 -m pip install -r requirements.txt
 ```
 
-## 输入文件
+## accounts.json（账号配置）
 
-1. 关键词 CSV（`--csv`）
-- 有表头时自动识别：`keyword` / `keywords` / `关键词` / `关键字` / `query` / `topic` / `话题`
-- 无表头时默认读取第一列
+每个账号至少需要 `cookie`
+需要手动在每个浏览器中设置refresh_window_tag，通过在console中输入 window.name='acc1'
 
-2. 账号 JSON（`--accounts`）
-- 必须是数组
-- 每个账号至少要有 `cookie`
-- 可选字段：`name`、`user_agent`、`referer`、`accept_language`、`qps`
+```json
+[
+  {
+    "name": "acc1",
+    "cookie": "SUB=...;",
+    "qps": 5.0,
+    "refresh_method": "mac",
+    "refresh_url_keyword": "profile/xxxx",
+    "refresh_window_keyword": "Chrome",
+    "refresh_window_index": 0,
+    "refresh_window_tag": "acc1"
+  }
+]
+```
 
-## 运行示例
+字段说明：
+- `name`：账号名称（日志里显示）。
+- `cookie`：必填。
+- `qps`：账号级限速，未填时使用 `run_config.json` 的 `per_account_qps`。
+- `refresh_method`：`auto` / `mac` / `windows`。
+- `refresh_url_keyword`：刷新/检测目标标签页 URL 关键词。
+- `refresh_window_keyword`：Windows 下激活窗口标题关键词。
+- `refresh_window_index`：mac 下按窗口序号绑定（1 开始，`0` 表示不指定）。
+- `refresh_window_tag`：mac 下优先按 `window.name` 绑定标签页（推荐）。
+
+在 Chrome 目标页 DevTools Console 设置标签：
+
+```javascript
+window.name = "acc1";
+```
+
+## run_config.json（主配置）
+
+`weibo_bulk_api.py` 当前实际支持的关键字段：
+- 输入输出：`csv`、`accounts`、`output`、`state_db`、`raw_log`、`keyword_column`
+- 抓取控制：`per_account_qps`、`concurrency`、`timeout`、`max_retries`、`max_media_pages`、`max_contrib_pages`、`allow_empty_contrib`、`limit`
+- 验证码闸门：`refresh_on_not_found`、`retry_false_after_verify`、`refresh_method`、`refresh_wait`、`verify_poll_interval`、`verify_cycle_timeout`、`refresh_url_keyword`、`refresh_window_keyword`、`refresh_window_index`、`refresh_window_tag`
+- 账号策略：`strict_account_isolation`、`fallback_to_other_accounts`
+- 验证码服务共用配置：`captcha_*`（供 `captcha_server.py --config` 读取）
+
+## 启动顺序
+
+### 1) 启动验证码后端
 
 ```bash
 cd 微博h5
-python3 weibo_bulk_api.py \
-  --csv ./keywors.csv \
-  --accounts ./accounts.json \
-  --output ./output/weibo_bulk_result.jsonl \
-  --state-db ./output/weibo_bulk_state.db \
-  --per-account-qps 1.0 \
-  --max-retries 3 \
-  --max-media-pages 12 \
-  --max-contrib-pages 3 \
-  --timeout 20 \
-  --allow-empty-contrib \
-  --refresh-on-not-found \
-  --refresh-method auto \
-  --refresh-wait 5 \
-  --verify-poll-interval 2 \
-  --verify-cycle-timeout 45 \
-  --refresh-url-keyword weibo \
-  --refresh-window-keyword Chrome
+python3 captcha_server.py --config ./run_config.json
 ```
 
-也可以把参数放进 JSON 配置文件：
+健康检查：
 
 ```bash
-python weibo_bulk_api.py --config ./run_config.json
+curl http://127.0.0.1:5050/health
 ```
 
-示例 `run_config.json`：
+### 2) 安装并启用 Chrome 扩展
 
-```json
-{
-  "csv": "./keywors.csv",
-  "accounts": "./accounts.json",
-  "output": "./output/weibo_bulk_result.jsonl",
-  "state_db": "./output/weibo_bulk_state.db",
-  "per_account_qps": 1.0,
-  "max_retries": 3,
-  "max_media_pages": 12,
-  "max_contrib_pages": 3,
-  "timeout": 20,
-  "allow_empty_contrib": true,
-  "refresh_on_not_found": true,
-  "refresh_method": "auto",
-  "refresh_wait": 5,
-  "verify_poll_interval": 2,
-  "verify_cycle_timeout": 45,
-  "refresh_url_keyword": "weibo",
-  "refresh_window_keyword": "Chrome"
-}
+- 打开 `chrome://extensions/`
+- 开启开发者模式
+- 加载已解压扩展：`微博h5/extension`
+
+### 3) 启动爬虫（单进程）
+
+```bash
+python3 weibo_bulk_api.py --config ./run_config.json
 ```
 
-命令行参数优先级高于配置文件（同名参数会覆盖配置值）。
+## 分片并行（多进程）
 
-## 参数说明（与当前脚本一致）
 
-- `--csv`：关键词 CSV 路径（必填）
-- `--accounts`：账号配置 JSON 路径（必填）
-- `--config`：JSON 配置文件路径（可把运行参数集中放在文件里）
-- `--output`：结果 JSONL 输出路径（默认 `output/weibo_bulk_result.jsonl`）
-- `--raw-log`：每次接口原始返回 JSONL 路径（默认不记录）
-- `--state-db`：断点续跑 SQLite 路径（默认 `output/weibo_bulk_state.db`）
-- `--keyword-column`：手动指定关键词列名
-- `--per-account-qps`：单账号 QPS（默认 `2.0`）
-- `--timeout`：请求超时秒数（默认 `20`）
-- `--max-retries`：失败重试次数（默认 `3`）
-- `--max-media-pages`：媒体列表最大翻页数（默认 `12`）
-- `--max-contrib-pages`：贡献榜最大翻页数（默认 `3`）
-- `--allow-empty-contrib`：贡献榜为空也算成功
-- `--limit`：只跑前 N 个关键词（调试用）
-- `--refresh-on-not-found`：命中 `found=false` 时暂停并刷新本地 Chrome
-- `--refresh-method`：刷新方式，`auto`/`mac`/`windows`（默认 `auto`）
-- `--refresh-wait`：验证成功后等待秒数（默认 `5.0`）
-- `--verify-poll-interval`：验证码状态轮询间隔秒数（默认 `2.0`）
-- `--verify-cycle-timeout`：单轮验证等待超时秒数，超时后自动再次刷新（默认 `45.0`）
-- `--refresh-url-keyword`：`mac` 模式下要刷新的标签页 URL 关键字（默认 `weibo`）
-- `--refresh-window-keyword`：`windows` 模式下激活窗口标题关键字（默认 `Chrome`）
+```bash
+python3 weibo_bulk_api.py --config ./run_config.json --shard-index 0 --shard-total 4 --output ./output/weibo_bulk_result.p0.jsonl --state-db ./output/weibo_bulk_state.p0.db > ./output/weibo_bulk_worker0.log 2>&1 &
+python3 weibo_bulk_api.py --config ./run_config.json --shard-index 1 --shard-total 4 --output ./output/weibo_bulk_result.p1.jsonl --state-db ./output/weibo_bulk_state.p1.db > ./output/weibo_bulk_worker1.log 2>&1 &
+python3 weibo_bulk_api.py --config ./run_config.json --shard-index 2 --shard-total 4 --output ./output/weibo_bulk_result.p2.jsonl --state-db ./output/weibo_bulk_state.p2.db > ./output/weibo_bulk_worker2.log 2>&1 &
+python3 weibo_bulk_api.py --config ./run_config.json --shard-index 3 --shard-total 4 --output ./output/weibo_bulk_result.p3.jsonl --state-db ./output/weibo_bulk_state.p3.db > ./output/weibo_bulk_worker3.log 2>&1 &
+```
 
-## 输出字段
+查看进程：
 
+```bash
+ps aux | rg "weibo_bulk_api.py.*--shard-index" | rg -v rg
+```
+
+停止分片：
+
+```bash
+pkill -f "weibo_bulk_api.py --config ./run_config.json --shard-index"
+```
+
+## 输出与续跑
+
+- 结果文件：`output/weibo_bulk_result*.jsonl`
+- 断点状态库：`output/weibo_bulk_state*.db`
+
+脚本会把成功关键词写入 `task_state`，下次启动会自动跳过已完成关键词（按对应 `state_db` 续跑）。
+
+`output` JSONL 单行示例字段：
 - `keyword`
 - `found`
 - `media_publish_count`
 - `host`
-- `publish_media_list`（`uid` / `screen_name`）
-- `top_contributors`（`rank` / `uid` / `name` / `contribution_value`）
-
-## 断点续跑
-
-状态记录在 `--state-db`（SQLite），已成功关键词会自动跳过。结果会追加写入 `--output`（JSONL）。
-
-## 验证码自动识别扩展
-
-### 功能特点
-- **双模式识别**：支持视觉识别和JS逆向两种验证码破解方式
-- **智能切换**：自动模式下优先尝试JS逆向，失败后备用视觉识别
-- **多种逆向技术**：Canvas Hook、网络拦截、全局变量搜索等
-- **真人模拟**：高度仿真的拖动轨迹和时间间隔
-
-### 安装和使用
-1. 在Chrome浏览器中打开 `chrome://extensions/`
-2. 启用"开发者模式"
-3. 点击"加载已解压的扩展程序"
-4. 选择项目目录下的 `extension` 文件夹
-
-### 测试页面
-提供专门的测试页面 `test_captcha.html` 用于验证扩展功能：
-- 视觉识别测试
-- JS逆向测试
-- 自动模式测试
-- 调试信息查看
-
-### 技术原理
-**视觉识别模式**：
-- 分析验证码背景图的阴影特征
-- 通过灰度值和像素密度定位缺口位置
-- 适用于大多数传统滑块验证码
-
-**JS逆向模式**：
-- Hook Canvas 绘制方法捕获原始图像
-- 拦截网络请求获取验证码数据
-- 搜索全局变量中的位置信息
-- 直接从JavaScript对象中提取缺口坐标
+- `publish_media_list`
+- `top_contributors`
 
 ## 注意事项
 
-- 账号 Cookie 失效时，接口成功率会显著下降。
-- `accounts.json` 里可为每个账号单独设置 `qps`，未设置时使用 `--per-account-qps`。
-- `mac` 模式通过 AppleScript 刷新 URL 匹配标签页；`windows` 模式通过 PowerShell 激活 Chrome 窗口并发送 `Ctrl+R`。
-- `mac/auto(mac)` 下，命中 `found=false` 后会进入"验证闸门"：仅当检测到验证码消失（插件验证成功）后才恢复爬取；若未成功会持续刷新并重试。
-- `mac/auto(mac)` 下推荐开启 Chrome：`查看 > 开发者 > 允许 Apple 事件中的 JavaScript`（未开启时会自动降级为 URL 状态检测）。
+- `concurrency` 会被自动限制为不超过账号数。
+- `strict_account_isolation=true` 时，会自动关闭跨账号回退（等价于不启用 `fallback_to_other_accounts`）。
+- 多进程时必须给每个分片使用不同的 `output` 与 `state_db`，避免写冲突。
+- `refresh_window_tag` 依赖 AppleScript 执行页面 JS；若 Chrome 没开该权限会触发降级逻辑（仅 URL 检测）。
+

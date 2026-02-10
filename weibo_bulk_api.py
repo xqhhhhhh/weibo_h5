@@ -43,6 +43,11 @@ class Account:
     referer: str
     accept_language: str
     qps: float
+    refresh_method: str
+    refresh_url_keyword: str
+    refresh_window_keyword: str
+    refresh_window_index: int
+    refresh_window_tag: str
 
 
 class RiskControlBlockedError(RuntimeError):
@@ -158,6 +163,8 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--raw-log", default="", help="记录每次接口原始返回的JSONL文件路径")
         p.add_argument("--state-db", default="output/weibo_bulk_state.db", help="断点续跑SQLite")
         p.add_argument("--keyword-column", default="", help="关键词列名")
+        p.add_argument("--shard-index", type=int, default=-1, help="关键词分片索引（从0开始，-1表示不分片）")
+        p.add_argument("--shard-total", type=int, default=1, help="关键词分片总数")
         p.add_argument("--per-account-qps", type=float, default=2.0, help="单账号QPS")
         p.add_argument("--timeout", type=float, default=20.0)
         p.add_argument("--max-retries", type=int, default=3)
@@ -166,6 +173,14 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--allow-empty-contrib", action="store_true", help="贡献榜为空也算成功")
         p.add_argument("--limit", type=int, default=0, help="仅调试前N个关键词")
         p.add_argument("--refresh-on-not-found", action="store_true", help="命中 found=false 时暂停并刷新本地 Chrome")
+        p.add_argument(
+            "--retry-false-after-verify",
+            dest="retry_false_after_verify",
+            action="store_true",
+            default=True,
+            help="命中 found=false 并完成验证闸门后，立即重抓该关键词一次",
+        )
+        p.add_argument("--no-retry-false-after-verify", dest="retry_false_after_verify", action="store_false", help=argparse.SUPPRESS)
         p.add_argument(
             "--refresh-method",
             choices=["auto", "mac", "windows"],
@@ -177,6 +192,26 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--verify-cycle-timeout", type=float, default=45.0, help="单轮验证等待超时秒数，超时后自动再次刷新")
         p.add_argument("--refresh-url-keyword", default="weibo", help="刷新标签页 URL 需包含的关键词")
         p.add_argument("--refresh-window-keyword", default="Chrome", help="Windows 激活窗口标题关键词")
+        p.add_argument("--refresh-window-index", type=int, default=0, help="mac下绑定 Chrome 窗口序号（从1开始，0表示不指定）")
+        p.add_argument("--refresh-window-tag", default="", help="mac下绑定窗口标签（window.name）")
+        p.add_argument("--concurrency", type=int, default=1, help="并发 worker 数（建议不超过账号数）")
+        p.add_argument("--strict-account-isolation", action="store_true", help="关键词固定单账号处理，不跨账号回退")
+        p.add_argument(
+            "--fallback-to-other-accounts",
+            dest="fallback_to_other_accounts",
+            action="store_true",
+            default=True,
+            help="主账号失败时回退到其他账号重试",
+        )
+        p.add_argument("--no-fallback-to-other-accounts", dest="fallback_to_other_accounts", action="store_false", help=argparse.SUPPRESS)
+        # 允许 run_config 与 captcha_server 共用，主爬虫不直接消费这些字段。
+        p.add_argument("--captcha-host", default="127.0.0.1", help=argparse.SUPPRESS)
+        p.add_argument("--captcha-port", type=int, default=5050, help=argparse.SUPPRESS)
+        p.add_argument("--captcha-timeout", type=float, default=15.0, help=argparse.SUPPRESS)
+        p.add_argument("--captcha-x-offset", type=int, default=0, help=argparse.SUPPRESS)
+        p.add_argument("--captcha-low-confidence-threshold", type=float, default=0.62, help=argparse.SUPPRESS)
+        p.add_argument("--captcha-consistency-tolerance", type=int, default=5, help=argparse.SUPPRESS)
+        p.add_argument("--captcha-debug", action="store_true", help=argparse.SUPPRESS)
         return p
 
     pre = argparse.ArgumentParser(add_help=False)
@@ -206,6 +241,10 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not str(args.csv).strip() or not str(args.accounts).strip():
         parser.error("--csv 和 --accounts 必填（可通过 --config 提供）")
+    if int(args.shard_total) <= 0:
+        parser.error("--shard-total 必须 > 0")
+    if int(args.shard_index) >= 0 and int(args.shard_index) >= int(args.shard_total):
+        parser.error("--shard-index 必须在 [0, shard_total) 范围内")
     return args
 
 
@@ -219,7 +258,7 @@ def detect_keyword_column(headers: List[str]) -> str:
     return headers[0]
 
 
-def load_keywords(csv_path: Path, keyword_column: str, limit: int) -> List[str]:
+def load_keywords(csv_path: Path, keyword_column: str, limit: int, shard_index: int, shard_total: int) -> List[str]:
     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames:
@@ -231,15 +270,19 @@ def load_keywords(csv_path: Path, keyword_column: str, limit: int) -> List[str]:
             f.seek(0)
             rows = [str((r[0] if r else "")).strip() for r in csv.reader(f)]
 
-    out: List[str] = []
+    out_all: List[str] = []
     seen = set()
     for k in rows:
         if not k or k in seen:
             continue
-        out.append(k)
+        out_all.append(k)
         seen.add(k)
-        if limit > 0 and len(out) >= limit:
-            break
+    if shard_index >= 0:
+        out = [k for k in out_all if (int(hashlib.md5(k.encode("utf-8")).hexdigest(), 16) % shard_total) == shard_index]
+    else:
+        out = out_all
+    if limit > 0:
+        out = out[:limit]
     return out
 
 
@@ -263,6 +306,11 @@ def load_accounts(path: Path, per_account_qps: float) -> List[Account]:
                 referer=str(x.get("referer") or "https://m.weibo.cn/"),
                 accept_language=str(x.get("accept_language") or "zh-CN,zh;q=0.9,en;q=0.8"),
                 qps=float(x.get("qps") or per_account_qps),
+                refresh_method=str(x.get("refresh_method") or "").strip().lower(),
+                refresh_url_keyword=str(x.get("refresh_url_keyword") or "").strip(),
+                refresh_window_keyword=str(x.get("refresh_window_keyword") or "").strip(),
+                refresh_window_index=int(x.get("refresh_window_index") or 0),
+                refresh_window_tag=str(x.get("refresh_window_tag") or "").strip(),
             )
         )
     if not out:
@@ -343,24 +391,44 @@ def persist_result(conn: sqlite3.Connection, output: Path, item: Dict[str, Any])
         f.write(json.dumps(public_item, ensure_ascii=False) + "\n")
 
 
-def refresh_chrome_tab_mac(url_keyword: str) -> Tuple[bool, str]:
+def refresh_chrome_tab_mac(url_keyword: str, window_index: int = 0, window_tag: str = "") -> Tuple[bool, str]:
     if sys.platform != "darwin":
         return False, "mac refresh requires macOS"
     safe_url_keyword = str(url_keyword).replace("\\", "\\\\").replace('"', '\\"')
+    safe_window_index = int(window_index or 0)
+    safe_window_tag = str(window_tag or "").replace("\\", "\\\\").replace('"', '\\"')
+    use_window_tag = bool(safe_window_tag)
+    use_window_index = safe_window_index > 0
+    url_check = "true" if not safe_url_keyword else f'(u contains "{safe_url_keyword}")'
+    tag_js = "(() => { try { return window.name || ''; } catch (e) { return ''; } })();"
+    safe_tag_js = tag_js.replace("\\", "\\\\").replace('"', '\\"')
     script = f'''
 tell application "Google Chrome"
     if (count of windows) is 0 then return "NO_WINDOW"
-    repeat with wi from 1 to (count of windows)
+    set winStart to 1
+    set winEnd to (count of windows)
+    if {"true" if use_window_index else "false"} then
+        if ({safe_window_index} > winEnd) then return "NO_WINDOW_INDEX"
+        set winStart to {safe_window_index}
+        set winEnd to {safe_window_index}
+    end if
+    repeat with wi from winStart to winEnd
         set w to window wi
         repeat with ti from 1 to (count of tabs of w)
             set t to tab (ti as integer) of w
             set u to URL of t
-            if u contains "{safe_url_keyword}" then
-                set active tab index of w to (ti as integer)
-                set index of w to 1
-                tell t to reload
-                activate
-                return "OK"
+            if {"true" if use_window_tag else "false"} then
+                set n to execute t javascript "{safe_tag_js}"
+                if n is missing value then set n to ""
+                if (n as text) is "{safe_window_tag}" then
+                    tell t to reload
+                    return "OK"
+                end if
+            else
+                if {url_check} then
+                    tell t to reload
+                    return "OK"
+                end if
             end if
         end repeat
     end repeat
@@ -415,25 +483,36 @@ def refresh_chrome_tab_windows(window_keyword: str) -> Tuple[bool, str]:
     return False, reason
 
 
-def refresh_local_chrome_tab(method: str, url_keyword: str, window_keyword: str) -> Tuple[bool, str]:
+def refresh_local_chrome_tab(
+    method: str,
+    url_keyword: str,
+    window_keyword: str,
+    window_index: int = 0,
+    window_tag: str = "",
+) -> Tuple[bool, str]:
     refresh_method = str(method or "auto").strip().lower()
     if refresh_method == "auto":
         if sys.platform == "darwin":
-            return refresh_chrome_tab_mac(url_keyword)
+            return refresh_chrome_tab_mac(url_keyword, window_index=window_index, window_tag=window_tag)
         if sys.platform == "win32":
             return refresh_chrome_tab_windows(window_keyword)
         return False, f"auto unsupported platform={sys.platform}"
     if refresh_method == "mac":
-        return refresh_chrome_tab_mac(url_keyword)
+        return refresh_chrome_tab_mac(url_keyword, window_index=window_index, window_tag=window_tag)
     if refresh_method == "windows":
         return refresh_chrome_tab_windows(window_keyword)
     return False, f"unknown refresh method={refresh_method}"
 
 
-def get_chrome_verify_state_mac(url_keyword: str) -> Tuple[bool, str]:
+def get_chrome_verify_state_mac(url_keyword: str, window_index: int = 0, window_tag: str = "") -> Tuple[bool, str]:
     if sys.platform != "darwin":
         return False, "mac verify check requires macOS"
     safe_url_keyword = str(url_keyword).replace("\\", "\\\\").replace('"', '\\"')
+    safe_window_index = int(window_index or 0)
+    safe_window_tag = str(window_tag or "").replace("\\", "\\\\").replace('"', '\\"')
+    use_window_tag = bool(safe_window_tag)
+    use_window_index = safe_window_index > 0
+    url_check = "true" if not safe_url_keyword else f'(u contains "{safe_url_keyword}")'
     js = (
         "(() => {"
         "  try {"
@@ -451,20 +530,37 @@ def get_chrome_verify_state_mac(url_keyword: str) -> Tuple[bool, str]:
         "})();"
     )
     safe_js = js.replace("\\", "\\\\").replace('"', '\\"')
+    tag_js = "(() => { try { return window.name || ''; } catch (e) { return ''; } })();"
+    safe_tag_js = tag_js.replace("\\", "\\\\").replace('"', '\\"')
     script = f'''
 tell application "Google Chrome"
     if (count of windows) is 0 then return "NO_WINDOW"
-    repeat with wi from 1 to (count of windows)
+    set winStart to 1
+    set winEnd to (count of windows)
+    if {"true" if use_window_index else "false"} then
+        if ({safe_window_index} > winEnd) then return "NO_WINDOW_INDEX"
+        set winStart to {safe_window_index}
+        set winEnd to {safe_window_index}
+    end if
+    repeat with wi from winStart to winEnd
         set w to window wi
         repeat with ti from 1 to (count of tabs of w)
             set t to tab (ti as integer) of w
             set u to URL of t
-            if u contains "{safe_url_keyword}" then
-                set active tab index of w to (ti as integer)
-                set index of w to 1
-                set r to execute t javascript "{safe_js}"
-                if r is missing value then return "PENDING"
-                return r as text
+            if {"true" if use_window_tag else "false"} then
+                set n to execute t javascript "{safe_tag_js}"
+                if n is missing value then set n to ""
+                if (n as text) is "{safe_window_tag}" then
+                    set r to execute t javascript "{safe_js}"
+                    if r is missing value then return "PENDING"
+                    return r as text
+                end if
+            else
+                if {url_check} then
+                    set r to execute t javascript "{safe_js}"
+                    if r is missing value then return "PENDING"
+                    return r as text
+                end if
             end if
         end repeat
     end repeat
@@ -488,22 +584,40 @@ end tell
     return True, out or "PENDING"
 
 
-def get_chrome_tab_url_mac(url_keyword: str) -> Tuple[bool, str]:
+def get_chrome_tab_url_mac(url_keyword: str, window_index: int = 0, window_tag: str = "") -> Tuple[bool, str]:
     if sys.platform != "darwin":
         return False, "mac url check requires macOS"
     safe_url_keyword = str(url_keyword).replace("\\", "\\\\").replace('"', '\\"')
+    safe_window_index = int(window_index or 0)
+    safe_window_tag = str(window_tag or "").replace("\\", "\\\\").replace('"', '\\"')
+    use_window_tag = bool(safe_window_tag)
+    use_window_index = safe_window_index > 0
+    url_check = "true" if not safe_url_keyword else f'(u contains "{safe_url_keyword}")'
+    tag_js = "(() => { try { return window.name || ''; } catch (e) { return ''; } })();"
+    safe_tag_js = tag_js.replace("\\", "\\\\").replace('"', '\\"')
     script = f'''
 tell application "Google Chrome"
     if (count of windows) is 0 then return "NO_WINDOW"
-    repeat with wi from 1 to (count of windows)
+    set winStart to 1
+    set winEnd to (count of windows)
+    if {"true" if use_window_index else "false"} then
+        if ({safe_window_index} > winEnd) then return "NO_WINDOW_INDEX"
+        set winStart to {safe_window_index}
+        set winEnd to {safe_window_index}
+    end if
+    repeat with wi from winStart to winEnd
         set w to window wi
         repeat with ti from 1 to (count of tabs of w)
             set t to tab (ti as integer) of w
             set u to URL of t
-            if u contains "{safe_url_keyword}" then
-                set active tab index of w to (ti as integer)
-                set index of w to 1
-                return u as text
+            if {"true" if use_window_tag else "false"} then
+                set n to execute t javascript "{safe_tag_js}"
+                if n is missing value then set n to ""
+                if (n as text) is "{safe_window_tag}" then return u as text
+            else
+                if {url_check} then
+                    return u as text
+                end if
             end if
         end repeat
     end repeat
@@ -527,96 +641,152 @@ end tell
     return True, out
 
 
-async def handle_not_found_gate(args: argparse.Namespace, keyword: str) -> None:
-    refresh_method = str(args.refresh_method or "auto").strip().lower()
-    supports_verify_poll = (refresh_method == "mac") or (refresh_method == "auto" and sys.platform == "darwin")
+def resolve_account_refresh_settings(args: argparse.Namespace, account: Optional[Account]) -> Tuple[str, str, str, int, str]:
+    method = str(args.refresh_method or "auto").strip().lower()
+    url_keyword = str(args.refresh_url_keyword or "weibo")
+    window_keyword = str(args.refresh_window_keyword or "Chrome")
+    window_index = int(args.refresh_window_index or 0)
+    window_tag = str(args.refresh_window_tag or "").strip()
+    if account:
+        if str(account.refresh_method or "").strip():
+            method = str(account.refresh_method).strip().lower()
+        if str(account.refresh_url_keyword or "").strip():
+            url_keyword = str(account.refresh_url_keyword).strip()
+        if str(account.refresh_window_keyword or "").strip():
+            window_keyword = str(account.refresh_window_keyword).strip()
+        if int(account.refresh_window_index or 0) > 0:
+            window_index = int(account.refresh_window_index)
+        if str(account.refresh_window_tag or "").strip():
+            window_tag = str(account.refresh_window_tag).strip()
+    return method, url_keyword, window_keyword, window_index, window_tag
 
-    if not supports_verify_poll:
-        print(f"[WARN] keyword={keyword} found=false, refresh Chrome then pause {args.refresh_wait:.1f}s")
-        ok, msg = await asyncio.to_thread(
-            refresh_local_chrome_tab,
-            str(args.refresh_method),
-            str(args.refresh_url_keyword),
-            str(args.refresh_window_keyword),
-        )
-        if ok:
+
+async def handle_not_found_gate(
+    args: argparse.Namespace,
+    keyword: str,
+    account: Optional[Account],
+    gate_lock: asyncio.Lock,
+) -> None:
+    refresh_method, refresh_url_keyword, refresh_window_keyword, refresh_window_index, refresh_window_tag = resolve_account_refresh_settings(args, account)
+    supports_verify_poll = (refresh_method == "mac") or (refresh_method == "auto" and sys.platform == "darwin")
+    acc_name = str(account.name) if account else "unknown"
+
+    async with gate_lock:
+        if not supports_verify_poll:
+            print(f"[WARN] account={acc_name} keyword={keyword} found=false, refresh Chrome then pause {args.refresh_wait:.1f}s")
+            ok, msg = await asyncio.to_thread(
+                refresh_local_chrome_tab,
+                str(refresh_method),
+                str(refresh_url_keyword),
+                str(refresh_window_keyword),
+                int(refresh_window_index),
+                str(refresh_window_tag),
+            )
+            if ok:
+                print(
+                    "[INFO] Chrome refresh success "
+                    f"account={acc_name} method={refresh_method} url_keyword={refresh_url_keyword} "
+                    f"window_keyword={refresh_window_keyword} window_index={refresh_window_index} window_tag={refresh_window_tag or '-'}"
+                )
+            else:
+                print(f"[WARN] Chrome refresh skipped/failed account={acc_name}: {msg}")
+            await asyncio.sleep(max(0.0, float(args.refresh_wait)))
+            return
+
+        cycle = 0
+        poll_interval = max(0.5, float(args.verify_poll_interval))
+        cycle_timeout = max(5.0, float(args.verify_cycle_timeout))
+        js_disabled_warned = False
+        while True:
+            cycle += 1
+            print(
+                f"[WARN] account={acc_name} keyword={keyword} found=false, "
+                f"verify gate cycle={cycle}: refresh and wait for plugin success"
+            )
+            ok, msg = await asyncio.to_thread(
+                refresh_local_chrome_tab,
+                str(refresh_method),
+                str(refresh_url_keyword),
+                str(refresh_window_keyword),
+                int(refresh_window_index),
+                str(refresh_window_tag),
+            )
+            if not ok:
+                print(f"[WARN] Chrome refresh skipped/failed account={acc_name}: {msg}")
+                await asyncio.sleep(poll_interval)
+                continue
+
             print(
                 "[INFO] Chrome refresh success "
-                f"method={args.refresh_method} url_keyword={args.refresh_url_keyword} "
-                f"window_keyword={args.refresh_window_keyword}"
+                f"account={acc_name} method={refresh_method} url_keyword={refresh_url_keyword} "
+                f"window_keyword={refresh_window_keyword} window_index={refresh_window_index} window_tag={refresh_window_tag or '-'}"
             )
-        else:
-            print(f"[WARN] Chrome refresh skipped/failed: {msg}")
-        await asyncio.sleep(max(0.0, float(args.refresh_wait)))
-        return
 
-    cycle = 0
-    poll_interval = max(0.5, float(args.verify_poll_interval))
-    cycle_timeout = max(5.0, float(args.verify_cycle_timeout))
-    js_disabled_warned = False
-    while True:
-        cycle += 1
-        print(f"[WARN] keyword={keyword} found=false, verify gate cycle={cycle}: refresh and wait for plugin success")
-        ok, msg = await asyncio.to_thread(
-            refresh_local_chrome_tab,
-            str(args.refresh_method),
-            str(args.refresh_url_keyword),
-            str(args.refresh_window_keyword),
-        )
-        if not ok:
-            print(f"[WARN] Chrome refresh skipped/failed: {msg}")
-            await asyncio.sleep(poll_interval)
-            continue
-
-        print(
-            "[INFO] Chrome refresh success "
-            f"method={args.refresh_method} url_keyword={args.refresh_url_keyword} "
-            f"window_keyword={args.refresh_window_keyword}"
-        )
-
-        begin = time.time()
-        while True:
-            state_ok, state = await asyncio.to_thread(get_chrome_verify_state_mac, str(args.refresh_url_keyword))
-            if not state_ok:
-                s = str(state or "")
-                if ("允许 Apple 事件中的 JavaScript" in s) or ("Apple events JavaScript" in s):
-                    if not js_disabled_warned:
-                        print(
-                            "[WARN] Chrome 关闭了 AppleScript 执行 JS，"
-                            "已降级为 URL 状态检测（离开 /captcha/show 视为验证成功）。"
-                        )
-                        js_disabled_warned = True
-                    url_ok, tab_url = await asyncio.to_thread(get_chrome_tab_url_mac, str(args.refresh_url_keyword))
-                    if url_ok:
-                        if "/captcha/show" not in str(tab_url):
-                            print(f"[INFO] verify success detected by URL, pause {args.refresh_wait:.1f}s then resume crawling")
-                            await asyncio.sleep(max(0.0, float(args.refresh_wait)))
-                            return
-                        elapsed = time.time() - begin
-                        if elapsed >= cycle_timeout:
-                            print(f"[WARN] verify not finished in {cycle_timeout:.1f}s, reloading captcha page")
+            begin = time.time()
+            while True:
+                state_ok, state = await asyncio.to_thread(
+                    get_chrome_verify_state_mac,
+                    str(refresh_url_keyword),
+                    int(refresh_window_index),
+                    str(refresh_window_tag),
+                )
+                if not state_ok:
+                    s = str(state or "")
+                    if ("允许 Apple 事件中的 JavaScript" in s) or ("Apple events JavaScript" in s):
+                        if str(refresh_window_tag or "").strip():
+                            print(
+                                "[WARN] tag绑定模式需要 AppleScript 执行 JS，"
+                                f"account={acc_name} window_tag={refresh_window_tag} 无法降级到 URL 检测。"
+                            )
                             break
-                        await asyncio.sleep(poll_interval)
-                        continue
-                    print(f"[WARN] verify URL check failed: {tab_url}")
+                        if not js_disabled_warned:
+                            print(
+                                "[WARN] Chrome 关闭了 AppleScript 执行 JS，"
+                                "已降级为 URL 状态检测（离开 /captcha/show 视为验证成功）。"
+                            )
+                            js_disabled_warned = True
+                        url_ok, tab_url = await asyncio.to_thread(
+                            get_chrome_tab_url_mac,
+                            str(refresh_url_keyword),
+                            int(refresh_window_index),
+                            str(refresh_window_tag),
+                        )
+                        if url_ok:
+                            if "/captcha/show" not in str(tab_url):
+                                print(
+                                    "[INFO] verify success detected by URL, "
+                                    f"account={acc_name}, pause {args.refresh_wait:.1f}s then resume crawling"
+                                )
+                                await asyncio.sleep(max(0.0, float(args.refresh_wait)))
+                                return
+                            elapsed = time.time() - begin
+                            if elapsed >= cycle_timeout:
+                                print(f"[WARN] verify not finished in {cycle_timeout:.1f}s, reloading captcha page")
+                                break
+                            await asyncio.sleep(poll_interval)
+                            continue
+                        print(f"[WARN] verify URL check failed account={acc_name}: {tab_url}")
+                        break
+                    print(f"[WARN] verify state check failed account={acc_name}: {state}")
                     break
-                print(f"[WARN] verify state check failed: {state}")
-                break
 
-            norm = str(state or "").strip().upper()
-            if norm == "OK":
-                print(f"[INFO] verify success detected, pause {args.refresh_wait:.1f}s then resume crawling")
-                await asyncio.sleep(max(0.0, float(args.refresh_wait)))
-                return
+                norm = str(state or "").strip().upper()
+                if norm == "OK":
+                    print(
+                        "[INFO] verify success detected, "
+                        f"account={acc_name}, pause {args.refresh_wait:.1f}s then resume crawling"
+                    )
+                    await asyncio.sleep(max(0.0, float(args.refresh_wait)))
+                    return
 
-            if norm.startswith("JSERR"):
-                print(f"[WARN] verify state js error: {state}")
+                if norm.startswith("JSERR"):
+                    print(f"[WARN] verify state js error account={acc_name}: {state}")
 
-            elapsed = time.time() - begin
-            if elapsed >= cycle_timeout:
-                print(f"[WARN] verify not finished in {cycle_timeout:.1f}s, reloading captcha page")
-                break
-            await asyncio.sleep(poll_interval)
+                elapsed = time.time() - begin
+                if elapsed >= cycle_timeout:
+                    print(f"[WARN] verify not finished in {cycle_timeout:.1f}s, reloading captcha page")
+                    break
+                await asyncio.sleep(poll_interval)
 
 
 def encode_query(raw_query: str) -> str:
@@ -745,10 +915,16 @@ async def fetch_contributors(cli: AccountClient, raw_query: str, max_pages: int)
 async def process_keyword(keyword: str, clients: List[AccountClient], args: argparse.Namespace) -> Dict[str, Any]:
     idx = int(hashlib.md5(keyword.encode("utf-8")).hexdigest(), 16) % len(clients)
     order = [clients[(idx + i) % len(clients)] for i in range(len(clients))]
+    strict_mode = bool(getattr(args, "strict_account_isolation", False))
+    fallback_mode = bool(getattr(args, "fallback_to_other_accounts", True))
+    if strict_mode:
+        fallback_mode = False
+    active_order = order if fallback_mode else [order[0]]
     last_err = ""
+    last_account = ""
 
     for attempt in range(1, args.max_retries + 1):
-        for cli in order:
+        for cli in active_order:
             try:
                 variants = build_query_variants(keyword)
                 for i, raw_query in enumerate(variants):
@@ -775,11 +951,13 @@ async def process_keyword(keyword: str, clients: List[AccountClient], args: argp
                         "host": host,
                         "publish_media_list": media_list,
                         "top_contributors": contrib_list,
+                        "_account": cli.account.name,
                         "_ok": True,
                         "_error": "",
                     }
             except Exception as e:  # noqa: BLE001
                 last_err = f"{type(e).__name__}: {e}"
+                last_account = cli.account.name
                 await asyncio.sleep(min(8.0, 0.6 * attempt + random.random()))
 
     return {
@@ -789,6 +967,7 @@ async def process_keyword(keyword: str, clients: List[AccountClient], args: argp
         "host": "",
         "publish_media_list": [],
         "top_contributors": [],
+        "_account": last_account,
         "_ok": False,
         "_error": last_err or "unknown",
     }
@@ -802,24 +981,98 @@ async def main_async(args: argparse.Namespace) -> int:
     if not accounts_path.exists():
         raise FileNotFoundError(f"账号文件不存在: {accounts_path}")
 
-    keywords = load_keywords(csv_path, args.keyword_column, args.limit)
+    keywords = load_keywords(
+        csv_path,
+        args.keyword_column,
+        args.limit,
+        int(args.shard_index),
+        int(args.shard_total),
+    )
     accounts = load_accounts(accounts_path, args.per_account_qps)
     raw_log_path = Path(args.raw_log).expanduser() if str(args.raw_log).strip() else None
     clients = [AccountClient(a, timeout=args.timeout, raw_log_path=raw_log_path) for a in accounts]
+    account_by_name: Dict[str, Account] = {a.name: a for a in accounts}
 
     conn = init_db(Path(args.state_db))
     done = get_done_keywords(conn)
     todo = [k for k in keywords if k not in done]
 
-    print(f"[INFO] keywords={len(keywords)} done={len(done)} todo={len(todo)} accounts={len(accounts)} mode=serial")
+    worker_count = max(1, int(args.concurrency))
+    if worker_count > len(accounts):
+        worker_count = len(accounts)
+    mode = "serial" if worker_count <= 1 else f"parallel({worker_count})"
+    strict_mode = bool(getattr(args, "strict_account_isolation", False))
+    fallback_mode = bool(getattr(args, "fallback_to_other_accounts", True))
+    if strict_mode:
+        fallback_mode = False
+    shard_desc = "all" if int(args.shard_index) < 0 else f"{int(args.shard_index)}/{int(args.shard_total)}"
+    print(
+        "[INFO] "
+        f"keywords={len(keywords)} done={len(done)} todo={len(todo)} accounts={len(accounts)} "
+        f"mode={mode} shard={shard_desc} "
+        f"strict_account_isolation={strict_mode} fallback_to_other_accounts={fallback_mode}"
+    )
 
     output_path = Path(args.output)
-    try:
-        for kw in todo:
-            result = await process_keyword(kw, clients, args)
+    persist_lock = asyncio.Lock()
+    gate_locks: Dict[str, asyncio.Lock] = {}
+
+    def gate_key_for_account(acc: Optional[Account]) -> str:
+        if not acc:
+            return "global"
+        method, url_kw, win_kw, win_idx, win_tag = resolve_account_refresh_settings(args, acc)
+        return f"{method}|{url_kw}|{win_kw}|{win_idx}|{win_tag}"
+
+    def gate_lock_for_account(acc: Optional[Account]) -> asyncio.Lock:
+        key = gate_key_for_account(acc)
+        lk = gate_locks.get(key)
+        if lk is None:
+            lk = asyncio.Lock()
+            gate_locks[key] = lk
+        return lk
+
+    async def run_one_keyword(kw: str) -> None:
+        result = await process_keyword(kw, clients, args)
+        if args.refresh_on_not_found and (result.get("found") is False):
+            acc_name = str(result.get("_account") or "")
+            acc_obj = account_by_name.get(acc_name) if acc_name else None
+            await handle_not_found_gate(args, kw, acc_obj, gate_lock_for_account(acc_obj))
+            if bool(getattr(args, "retry_false_after_verify", True)):
+                print(f"[INFO] account={acc_name or '-'} keyword={kw} retry once after verify gate")
+                retry_result = await process_keyword(kw, clients, args)
+                # 二次结果作为最终写入结果（无论是否变为 true）。
+                result = retry_result
+        async with persist_lock:
             persist_result(conn, output_path, result)
-            if args.refresh_on_not_found and (result.get("found") is False):
-                await handle_not_found_gate(args, kw)
+
+    try:
+        if worker_count <= 1:
+            for kw in todo:
+                await run_one_keyword(kw)
+        else:
+            queue: asyncio.Queue[str] = asyncio.Queue()
+            for kw in todo:
+                queue.put_nowait(kw)
+
+            async def worker(worker_id: int) -> None:
+                while True:
+                    try:
+                        kw = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                    try:
+                        await run_one_keyword(kw)
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[ERROR] worker={worker_id} keyword={kw} error={type(e).__name__}: {e}")
+                    finally:
+                        queue.task_done()
+
+            tasks = [asyncio.create_task(worker(i + 1)) for i in range(worker_count)]
+            await queue.join()
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         for c in clients:
             await c.close()

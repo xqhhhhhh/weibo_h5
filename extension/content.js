@@ -1,4 +1,4 @@
-const EXT_BUILD = "2026-02-10-ddddocr";
+const EXT_BUILD = "2026-02-10-ddddocr-v2";
 
 const BG_SELECTORS = [
   ".yidun_bg-img",
@@ -21,6 +21,10 @@ const CAPTCHA_CONTAINER_SELECTORS = [
   ".yidun_control",
   ".yidun",
 ];
+
+const LOW_CONF_LEVELS = new Set(["low"]);
+const AUTO_RETRY_MAX = 2;
+const LOW_CONF_RETRY_MAX = 1;
 
 let solveInProgress = false;
 let autoRetryTimer = null;
@@ -61,6 +65,10 @@ function waitForElement(selectors, validate, timeoutMs = 15000, intervalMs = 200
   });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function extractUrlFromStyle(styleValue) {
   if (!styleValue) return "";
   const m = String(styleValue).match(/url\(["']?(.*?)["']?\)/i);
@@ -77,6 +85,36 @@ function getImageUrl(el) {
   return computed;
 }
 
+async function waitForImageStable(imageEl, rounds = 3, intervalMs = 120) {
+  if (!imageEl) throw new Error("image element missing");
+  let prev = "";
+  let stable = 0;
+  const begin = Date.now();
+
+  while (Date.now() - begin < 3000) {
+    const url = getImageUrl(imageEl);
+    const w = Number(imageEl.naturalWidth || imageEl.width || 0);
+    const h = Number(imageEl.naturalHeight || imageEl.height || 0);
+    const key = `${url}|${w}|${h}`;
+    if (url && w > 0 && h > 0 && key === prev) {
+      stable += 1;
+      if (stable >= rounds) return { url, w, h };
+    } else {
+      stable = 0;
+      prev = key;
+    }
+    await sleep(intervalMs);
+  }
+
+  const fallbackUrl = getImageUrl(imageEl);
+  const fw = Number(imageEl.naturalWidth || imageEl.width || 0);
+  const fh = Number(imageEl.naturalHeight || imageEl.height || 0);
+  if (fallbackUrl && fw > 0 && fh > 0) {
+    return { url: fallbackUrl, w: fw, h: fh };
+  }
+  throw new Error("image not stable");
+}
+
 function getSliderHandle(slider) {
   if (!slider) return null;
   const control = slider.closest(".yidun_control");
@@ -90,10 +128,6 @@ function checkCaptchaSuccess() {
   if (!isElementVisible(container)) return true;
   const bg = queryFirst(BG_SELECTORS);
   return !isElementVisible(bg);
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function generateHumanTrack(distance) {
@@ -185,92 +219,152 @@ function calcDistanceFromBackend(imageX, bgNaturalWidth, trackRect, sliderRect) 
   return Math.max(1, Math.min(Math.round(raw), Math.round(maxDistance)));
 }
 
-async function solveSliderCaptcha() {
-  if (solveInProgress) return;
+async function performDrag(sliderHandle, totalDistance) {
+  const sliderRect = sliderHandle.getBoundingClientRect();
+  const startX = sliderRect.left + sliderRect.width / 2;
+  const startY = sliderRect.top + sliderRect.height / 2;
+
+  simulatePointerEvent(sliderHandle, "pointermove", startX, startY);
+  simulateMouseEvent(sliderHandle, "mousemove", startX, startY);
+  await sleep(120 + Math.random() * 180);
+
+  simulatePointerEvent(sliderHandle, "pointerdown", startX, startY, 1);
+  simulateMouseEvent(sliderHandle, "mousedown", startX, startY);
+  await sleep(80 + Math.random() * 140);
+
+  const track = generateHumanTrack(totalDistance);
+  let currentX = startX;
+  let currentY = startY;
+
+  for (const step of track) {
+    if (step.pause) {
+      await sleep(step.pause);
+      continue;
+    }
+    currentX += step.x;
+    currentY += step.y;
+    dispatchMoveToTargets("move", currentX, currentY, 1);
+    await sleep(7 + Math.random() * 24);
+  }
+
+  // 末端微调，降低边界误差导致的失败概率。
+  const tweaks = [
+    1 + Math.floor(Math.random() * 2),
+    -(1 + Math.floor(Math.random() * 2)),
+    1,
+  ];
+  for (const delta of tweaks) {
+    currentX += delta;
+    dispatchMoveToTargets("move", currentX, currentY, 1);
+    await sleep(18 + Math.random() * 26);
+  }
+
+  await sleep(60 + Math.random() * 110);
+  dispatchMoveToTargets("up", currentX, currentY, 0);
+}
+
+async function solveOnce(ctx) {
+  const [bgImg, pieceImg, slider] = await Promise.all([
+    waitForElement(BG_SELECTORS, (el) => isElementVisible(el), 12000, 180),
+    waitForElement(PIECE_SELECTORS, (el) => isElementVisible(el), 12000, 180),
+    waitForElement(SLIDER_SELECTORS, (el) => isElementVisible(el), 12000, 180),
+  ]);
+
+  const [{ url: bgUrl, w: bgW }, { url: pieceUrl }] = await Promise.all([
+    waitForImageStable(bgImg, 2, 120),
+    waitForImageStable(pieceImg, 2, 120),
+  ]);
+
+  if (!bgUrl || !pieceUrl) {
+    throw new Error(`image url missing bg=${Boolean(bgUrl)} piece=${Boolean(pieceUrl)}`);
+  }
+
+  const sliderHandle = getSliderHandle(slider);
+  if (!sliderHandle) throw new Error("slider handle not found");
+
+  const sliderRect = sliderHandle.getBoundingClientRect();
+  const trackEl = sliderHandle.closest(".yidun_slider_track") || sliderHandle.closest(".yidun_control") || sliderHandle;
+  const trackRect = trackEl.getBoundingClientRect();
+
+  const backend = await requestSolveFromBackend({
+    bg_url: bgUrl,
+    piece_url: pieceUrl,
+    page_url: location.href,
+    ua: navigator.userAgent,
+    ts: Date.now(),
+  });
+
+  const imageX = Number(backend.image_x ?? backend.raw_x ?? backend.x ?? -1);
+  if (!Number.isFinite(imageX) || imageX < 0) {
+    throw new Error(`invalid backend image_x=${backend.image_x}`);
+  }
+
+  const confidenceLevel = String(backend.confidence_level || "").toLowerCase();
+  const confidence = Number(backend.confidence ?? 0);
+
+  if (LOW_CONF_LEVELS.has(confidenceLevel) && ctx.lowConfRetries < LOW_CONF_RETRY_MAX) {
+    console.log("[captcha-ext] low confidence, retry once", {
+      confidenceLevel,
+      confidence,
+      strategy: backend.strategy,
+    });
+    await sleep(240 + Math.random() * 260);
+    return solveOnce({ ...ctx, lowConfRetries: ctx.lowConfRetries + 1 });
+  }
+
+  const bgNaturalWidth = Number(bgImg.naturalWidth || bgImg.width || bgW || backend.bg_width || 0);
+  const totalDistance = calcDistanceFromBackend(imageX, bgNaturalWidth, trackRect, sliderRect);
+
+  await performDrag(sliderHandle, totalDistance);
+
+  await sleep(1600);
+  if (!checkCaptchaSuccess()) {
+    throw new Error("captcha still visible after drag");
+  }
+
+  console.log("[captcha-ext] solved", {
+    imageX,
+    totalDistance,
+    bgNaturalWidth,
+    confidence,
+    confidenceLevel,
+    strategy: backend.strategy,
+  });
+  return { ok: true };
+}
+
+async function solveSliderCaptcha(options = {}) {
+  const opts = {
+    source: "auto",
+    retryCount: 0,
+    autoRetry: true,
+    ...options,
+  };
+
+  if (solveInProgress) {
+    return { ok: false, error: "solve busy" };
+  }
   solveInProgress = true;
 
   try {
-    const [bgImg, pieceImg, slider] = await Promise.all([
-      waitForElement(BG_SELECTORS, (el) => isElementVisible(el), 12000, 180),
-      waitForElement(PIECE_SELECTORS, (el) => isElementVisible(el), 12000, 180),
-      waitForElement(SLIDER_SELECTORS, (el) => isElementVisible(el), 12000, 180),
-    ]);
-
-    const bgUrl = getImageUrl(bgImg);
-    const pieceUrl = getImageUrl(pieceImg);
-    if (!bgUrl || !pieceUrl) {
-      throw new Error(`image url missing bg=${Boolean(bgUrl)} piece=${Boolean(pieceUrl)}`);
-    }
-
-    const sliderHandle = getSliderHandle(slider);
-    if (!sliderHandle) throw new Error("slider handle not found");
-
-    const sliderRect = sliderHandle.getBoundingClientRect();
-    const trackEl = sliderHandle.closest(".yidun_slider_track") || sliderHandle.closest(".yidun_control") || sliderHandle;
-    const trackRect = trackEl.getBoundingClientRect();
-
-    const backend = await requestSolveFromBackend({
-      bg_url: bgUrl,
-      piece_url: pieceUrl,
-      page_url: location.href,
-      ua: navigator.userAgent,
-      ts: Date.now(),
-    });
-
-    const imageX = Number(backend.image_x ?? backend.raw_x ?? backend.x ?? -1);
-    if (!Number.isFinite(imageX) || imageX < 0) {
-      throw new Error(`invalid backend image_x=${backend.image_x}`);
-    }
-
-    const bgNaturalWidth = Number(bgImg.naturalWidth || bgImg.width || backend.bg_width || 0);
-    const totalDistance = calcDistanceFromBackend(imageX, bgNaturalWidth, trackRect, sliderRect);
-
-    const startX = sliderRect.left + sliderRect.width / 2;
-    const startY = sliderRect.top + sliderRect.height / 2;
-
-    simulatePointerEvent(sliderHandle, "pointermove", startX, startY);
-    simulateMouseEvent(sliderHandle, "mousemove", startX, startY);
-    await sleep(120 + Math.random() * 180);
-
-    simulatePointerEvent(sliderHandle, "pointerdown", startX, startY, 1);
-    simulateMouseEvent(sliderHandle, "mousedown", startX, startY);
-    await sleep(80 + Math.random() * 140);
-
-    const track = generateHumanTrack(totalDistance);
-    let currentX = startX;
-    let currentY = startY;
-
-    for (const step of track) {
-      if (step.pause) {
-        await sleep(step.pause);
-        continue;
-      }
-      currentX += step.x;
-      currentY += step.y;
-      dispatchMoveToTargets("move", currentX, currentY, 1);
-      await sleep(7 + Math.random() * 24);
-    }
-
-    await sleep(60 + Math.random() * 110);
-    dispatchMoveToTargets("up", currentX, currentY, 0);
-
-    await sleep(1600);
-    if (!checkCaptchaSuccess()) {
-      throw new Error("captcha still visible after drag");
-    }
-
-    console.log("[captcha-ext] solved", { imageX, totalDistance, bgNaturalWidth });
+    const result = await solveOnce({ lowConfRetries: 0 });
+    return result;
   } catch (err) {
     console.log("[captcha-ext] solve failed", err);
-    if (autoRetryTimer) clearTimeout(autoRetryTimer);
-    autoRetryTimer = setTimeout(() => {
-      solveInProgress = false;
-      solveSliderCaptcha().catch(() => {});
-    }, 1300);
-    return;
-  }
 
-  solveInProgress = false;
+    if (opts.autoRetry && opts.retryCount < AUTO_RETRY_MAX) {
+      if (autoRetryTimer) clearTimeout(autoRetryTimer);
+      const nextRetry = opts.retryCount + 1;
+      const waitMs = 1200 + nextRetry * 500;
+      autoRetryTimer = setTimeout(() => {
+        solveSliderCaptcha({ source: "auto-retry", retryCount: nextRetry, autoRetry: true }).catch(() => {});
+      }, waitMs);
+    }
+
+    return { ok: false, error: String(err?.message || err) };
+  } finally {
+    solveInProgress = false;
+  }
 }
 
 function installTestButton() {
@@ -321,16 +415,10 @@ function installTestButton() {
     btn.dataset.running = "1";
     btn.textContent = "测试中...";
     status.textContent = "正在发送当前页面验证码到后端";
-    try {
-      solveInProgress = false;
-      await solveSliderCaptcha();
-      status.textContent = "完成";
-    } catch (err) {
-      status.textContent = `失败: ${String(err?.message || err)}`;
-    } finally {
-      btn.dataset.running = "0";
-      btn.textContent = "验证码测试";
-    }
+    const r = await solveSliderCaptcha({ source: "manual-test", retryCount: 0, autoRetry: false });
+    status.textContent = r.ok ? "完成" : `失败: ${String(r.error || "unknown")}`;
+    btn.dataset.running = "0";
+    btn.textContent = "验证码测试";
   });
 
   wrap.appendChild(btn);
@@ -341,7 +429,7 @@ function installTestButton() {
 function maybeAutoStart() {
   const hasCaptcha = Boolean(queryFirst(BG_SELECTORS) && queryFirst(PIECE_SELECTORS) && queryFirst(SLIDER_SELECTORS));
   if (hasCaptcha) {
-    solveSliderCaptcha().catch(() => {});
+    solveSliderCaptcha({ source: "load", retryCount: 0, autoRetry: true }).catch(() => {});
   }
 }
 
@@ -351,8 +439,7 @@ window.addEventListener("load", () => {
 });
 
 window.addEventListener("codex-run-captcha", () => {
-  solveInProgress = false;
-  solveSliderCaptcha().catch(() => {});
+  solveSliderCaptcha({ source: "event", retryCount: 0, autoRetry: true }).catch(() => {});
 });
 
 const observer = new MutationObserver(() => {
@@ -360,7 +447,9 @@ const observer = new MutationObserver(() => {
   const hasCaptcha = Boolean(queryFirst(BG_SELECTORS) && queryFirst(PIECE_SELECTORS) && queryFirst(SLIDER_SELECTORS));
   if (hasCaptcha) {
     setTimeout(() => {
-      if (!solveInProgress) solveSliderCaptcha().catch(() => {});
+      if (!solveInProgress) {
+        solveSliderCaptcha({ source: "mutation", retryCount: 0, autoRetry: true }).catch(() => {});
+      }
     }, 250);
   }
 });
