@@ -209,6 +209,7 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--captcha-port", type=int, default=5050, help=argparse.SUPPRESS)
         p.add_argument("--captcha-timeout", type=float, default=15.0, help=argparse.SUPPRESS)
         p.add_argument("--captcha-x-offset", type=int, default=0, help=argparse.SUPPRESS)
+        p.add_argument("--captcha-distance-offset-px", type=int, default=0, help=argparse.SUPPRESS)
         p.add_argument("--captcha-low-confidence-threshold", type=float, default=0.62, help=argparse.SUPPRESS)
         p.add_argument("--captcha-consistency-tolerance", type=int, default=5, help=argparse.SUPPRESS)
         p.add_argument("--captcha-debug", action="store_true", help=argparse.SUPPRESS)
@@ -366,7 +367,7 @@ def persist_result(conn: sqlite3.Connection, output: Path, item: Dict[str, Any])
     output.parent.mkdir(parents=True, exist_ok=True)
     kw = item["keyword"]
     now = int(time.time())
-    status = "success" if item.get("_ok") else "failed"
+    status = "success" if item.get("found") is True else "failed"
     public_item = {k: v for k, v in item.items() if not k.startswith("_")}
 
     conn.execute(
@@ -994,9 +995,6 @@ async def main_async(args: argparse.Namespace) -> int:
     account_by_name: Dict[str, Account] = {a.name: a for a in accounts}
 
     conn = init_db(Path(args.state_db))
-    done = get_done_keywords(conn)
-    todo = [k for k in keywords if k not in done]
-
     worker_count = max(1, int(args.concurrency))
     if worker_count > len(accounts):
         worker_count = len(accounts)
@@ -1006,9 +1004,10 @@ async def main_async(args: argparse.Namespace) -> int:
     if strict_mode:
         fallback_mode = False
     shard_desc = "all" if int(args.shard_index) < 0 else f"{int(args.shard_index)}/{int(args.shard_total)}"
+    initial_done = get_done_keywords(conn)
     print(
         "[INFO] "
-        f"keywords={len(keywords)} done={len(done)} todo={len(todo)} accounts={len(accounts)} "
+        f"keywords={len(keywords)} done={len(initial_done)} todo={len(keywords) - len(initial_done)} accounts={len(accounts)} "
         f"mode={mode} shard={shard_desc} "
         f"strict_account_isolation={strict_mode} fallback_to_other_accounts={fallback_mode}"
     )
@@ -1046,33 +1045,51 @@ async def main_async(args: argparse.Namespace) -> int:
             persist_result(conn, output_path, result)
 
     try:
-        if worker_count <= 1:
-            for kw in todo:
-                await run_one_keyword(kw)
-        else:
-            queue: asyncio.Queue[str] = asyncio.Queue()
-            for kw in todo:
-                queue.put_nowait(kw)
+        round_idx = 0
+        while True:
+            done = get_done_keywords(conn)
+            todo = [k for k in keywords if k not in done]
+            if not todo:
+                break
 
-            async def worker(worker_id: int) -> None:
-                while True:
-                    try:
-                        kw = queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        return
-                    try:
-                        await run_one_keyword(kw)
-                    except Exception as e:  # noqa: BLE001
-                        print(f"[ERROR] worker={worker_id} keyword={kw} error={type(e).__name__}: {e}")
-                    finally:
-                        queue.task_done()
+            round_idx += 1
+            print(f"[INFO] round={round_idx} start done={len(done)} remaining={len(todo)}")
+            before_done_count = len(done)
 
-            tasks = [asyncio.create_task(worker(i + 1)) for i in range(worker_count)]
-            await queue.join()
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            if worker_count <= 1:
+                for kw in todo:
+                    await run_one_keyword(kw)
+            else:
+                queue: asyncio.Queue[str] = asyncio.Queue()
+                for kw in todo:
+                    queue.put_nowait(kw)
+
+                async def worker(worker_id: int) -> None:
+                    while True:
+                        try:
+                            kw = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            return
+                        try:
+                            await run_one_keyword(kw)
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[ERROR] worker={worker_id} keyword={kw} error={type(e).__name__}: {e}")
+                        finally:
+                            queue.task_done()
+
+                tasks = [asyncio.create_task(worker(i + 1)) for i in range(worker_count)]
+                await queue.join()
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            after_done_count = len(get_done_keywords(conn))
+            progressed = after_done_count - before_done_count
+            remaining = len(keywords) - after_done_count
+            print(f"[INFO] round={round_idx} end progress={progressed} remaining={remaining}")
+            if remaining > 0 and progressed <= 0:
+                await asyncio.sleep(1.0)
     finally:
         for c in clients:
             await c.close()

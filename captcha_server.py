@@ -7,9 +7,12 @@ import json
 import logging
 import re
 import statistics
+import time
 from dataclasses import dataclass
+from itertools import count
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -27,6 +30,7 @@ else:
 APP = Flask(__name__)
 _HTTP = requests.Session()
 _SOLVER = None
+_REQ_SEQ = count(1)
 
 
 @dataclass
@@ -45,6 +49,7 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--port", type=int, default=5050)
         p.add_argument("--timeout", type=float, default=15.0, help="下载验证码图片超时")
         p.add_argument("--x-offset", type=int, default=0, help="识别x坐标补偿(像素)")
+        p.add_argument("--distance-offset-px", type=int, default=0, help="前端轨道距离补偿(像素)")
         p.add_argument("--low-confidence-threshold", type=float, default=0.62, help="低置信度阈值")
         p.add_argument("--consistency-tolerance", type=int, default=5, help="多策略结果x偏差容忍")
         p.add_argument("--debug", action="store_true")
@@ -72,6 +77,7 @@ def parse_args() -> argparse.Namespace:
             "port": "port",
             "timeout": "timeout",
             "x_offset": "x_offset",
+            "distance_offset_px": "distance_offset_px",
             "low_confidence_threshold": "low_confidence_threshold",
             "consistency_tolerance": "consistency_tolerance",
             "debug": "debug",
@@ -80,6 +86,7 @@ def parse_args() -> argparse.Namespace:
             "captcha_port": "port",
             "captcha_timeout": "timeout",
             "captcha_x_offset": "x_offset",
+            "captcha_distance_offset_px": "distance_offset_px",
             "captcha_low_confidence_threshold": "low_confidence_threshold",
             "captcha_consistency_tolerance": "consistency_tolerance",
             "captcha_debug": "debug",
@@ -234,6 +241,23 @@ def run_candidates(solver: Any, variants: Dict[str, Tuple[bytes, bytes]]) -> Lis
     return out
 
 
+def _short_url_label(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return "-"
+    if raw.startswith("data:"):
+        return f"data-url(len={len(raw)})"
+    try:
+        p = urlparse(raw)
+        host = p.netloc or "-"
+        path = p.path or "/"
+        if len(path) > 40:
+            path = f"{path[:40]}..."
+        return f"{host}{path}"
+    except Exception:  # noqa: BLE001
+        return raw[:60]
+
+
 def select_best(candidates: List[MatchCandidate], tolerance: int, low_thr: float) -> Dict[str, Any]:
     if not candidates:
         raise ValueError("all matching strategies failed")
@@ -291,12 +315,23 @@ def health() -> Any:
 def solve_captcha() -> Any:
     args = APP.config["ARGS"]
     data = request.get_json(silent=True) or {}
+    req_id = next(_REQ_SEQ)
+    started = time.perf_counter()
 
     bg_url = str(data.get("bg_url") or "").strip()
     piece_url = str(data.get("piece_url") or "").strip()
     referer = str(data.get("page_url") or "").strip()
 
+    APP.logger.info(
+        "[solve:%s] start bg=%s piece=%s referer=%s",
+        req_id,
+        _short_url_label(bg_url),
+        _short_url_label(piece_url),
+        _short_url_label(referer),
+    )
+
     if not bg_url or not piece_url:
+        APP.logger.warning("[solve:%s] bad request: missing bg_url or piece_url", req_id)
         return jsonify({"ok": False, "error": "bg_url and piece_url are required"}), 400
 
     try:
@@ -319,12 +354,28 @@ def solve_captcha() -> Any:
         if image_x < 0:
             image_x = 0
 
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        APP.logger.info(
+            "[solve:%s] ok image_x=%d raw_x=%d confidence=%.4f level=%s strategy=%s support=%d/%d distance_offset_px=%d cost_ms=%d",
+            req_id,
+            image_x,
+            int(chosen["x"]),
+            float(chosen["confidence"]),
+            str(chosen["confidence_level"]),
+            str(chosen["strategy"]),
+            int(chosen["support_count"]),
+            int(chosen["candidate_count"]),
+            int(args.distance_offset_px),
+            elapsed_ms,
+        )
+
         return jsonify(
             {
                 "ok": True,
                 "image_x": image_x,
                 "raw_x": int(chosen["x"]),
                 "x_offset": int(args.x_offset),
+                "distance_offset_px": int(args.distance_offset_px),
                 "confidence": chosen["confidence"],
                 "confidence_level": chosen["confidence_level"],
                 "strategy": chosen["strategy"],
@@ -338,7 +389,8 @@ def solve_captcha() -> Any:
             }
         )
     except Exception as exc:  # noqa: BLE001
-        APP.logger.exception("captcha solve failed")
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        APP.logger.exception("[solve:%s] failed cost_ms=%d", req_id, elapsed_ms)
         return jsonify({"ok": False, "error": f"solve failed: {type(exc).__name__}: {exc}"}), 500
 
 

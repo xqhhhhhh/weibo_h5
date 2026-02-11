@@ -1,1 +1,3 @@
 output/
+.venv312/
+__pycache__/

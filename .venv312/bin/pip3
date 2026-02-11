@@ -1,4 +1,4 @@
-#!/Users/xuqihan/Desktop/咸鱼/爬虫/微博h5/.venv312/bin/python3.12
+#!/Users/xuqihan/Desktop/咸鱼/爬虫/weibo_h5/.venv312/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys

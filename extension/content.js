@@ -211,10 +211,10 @@ function requestSolveFromBackend(payload) {
   });
 }
 
-function calcDistanceFromBackend(imageX, bgNaturalWidth, trackRect, sliderRect) {
+function calcDistanceFromBackend(imageX, bgNaturalWidth, trackRect, sliderRect, distanceOffsetPx = 0) {
   const scale = bgNaturalWidth > 0 ? (trackRect.width / bgNaturalWidth) : 1;
   const sliderInitOffset = sliderRect.left - trackRect.left;
-  const raw = imageX * scale - sliderInitOffset - (sliderRect.width / 2);
+  const raw = imageX * scale - sliderInitOffset - (sliderRect.width / 2) + distanceOffsetPx;
   const maxDistance = Math.max(1, trackRect.width - sliderRect.width);
   return Math.max(1, Math.min(Math.round(raw), Math.round(maxDistance)));
 }
@@ -301,6 +301,8 @@ async function solveOnce(ctx) {
 
   const confidenceLevel = String(backend.confidence_level || "").toLowerCase();
   const confidence = Number(backend.confidence ?? 0);
+  const backendDistanceOffset = Number(backend.distance_offset_px ?? 0);
+  const distanceOffsetPx = Number.isFinite(backendDistanceOffset) ? backendDistanceOffset : 0;
 
   if (LOW_CONF_LEVELS.has(confidenceLevel) && ctx.lowConfRetries < LOW_CONF_RETRY_MAX) {
     console.log("[captcha-ext] low confidence, retry once", {
@@ -313,7 +315,7 @@ async function solveOnce(ctx) {
   }
 
   const bgNaturalWidth = Number(bgImg.naturalWidth || bgImg.width || bgW || backend.bg_width || 0);
-  const totalDistance = calcDistanceFromBackend(imageX, bgNaturalWidth, trackRect, sliderRect);
+  const totalDistance = calcDistanceFromBackend(imageX, bgNaturalWidth, trackRect, sliderRect, distanceOffsetPx);
 
   await performDrag(sliderHandle, totalDistance);
 
@@ -325,6 +327,7 @@ async function solveOnce(ctx) {
   console.log("[captcha-ext] solved", {
     imageX,
     totalDistance,
+    distanceOffsetPx,
     bgNaturalWidth,
     confidence,
     confidenceLevel,

@@ -5,13 +5,6 @@
 - `captcha_server.py`：本地滑块识别服务（给 Chrome 扩展调用）。
 - `extension/`：Chrome 扩展，自动识别/拖动验证码。
 
-## 安装
-
-```bash
-cd 微博h5
-python3 -m pip install -r requirements.txt
-```
-
 ## accounts.json（账号配置）
 
 每个账号至少需要 `cookie`
@@ -31,33 +24,26 @@ python3 -m pip install -r requirements.txt
   }
 ]
 ```
+### 安装并启用 Chrome 扩展
 
-字段说明：
-- `name`：账号名称（日志里显示）。
-- `cookie`：必填。
-- `qps`：账号级限速，未填时使用 `run_config.json` 的 `per_account_qps`。
-- `refresh_method`：`auto` / `mac` / `windows`。
-- `refresh_url_keyword`：刷新/检测目标标签页 URL 关键词。
-- `refresh_window_keyword`：Windows 下激活窗口标题关键词。
-- `refresh_window_index`：mac 下按窗口序号绑定（1 开始，`0` 表示不指定）。
-- `refresh_window_tag`：mac 下优先按 `window.name` 绑定标签页（推荐）。
+- 打开 `chrome://extensions/`
+- 开启开发者模式
+- 加载已解压扩展：`微博h5/extension`
 
-在 Chrome 目标页 DevTools Console 设置标签：
+## ddddocr调试
+后端只能识别两张图片之间的距离差，然后传给前端，但前端本身的像素点偏移需要进行调试
+通过"captcha_distance_offset_px": 25 这个参数进行调试
 
-```javascript
-window.name = "acc1";
-```
 
-## run_config.json（主配置）
-
-`weibo_bulk_api.py` 当前实际支持的关键字段：
-- 输入输出：`csv`、`accounts`、`output`、`state_db`、`raw_log`、`keyword_column`
-- 抓取控制：`per_account_qps`、`concurrency`、`timeout`、`max_retries`、`max_media_pages`、`max_contrib_pages`、`allow_empty_contrib`、`limit`
-- 验证码闸门：`refresh_on_not_found`、`retry_false_after_verify`、`refresh_method`、`refresh_wait`、`verify_poll_interval`、`verify_cycle_timeout`、`refresh_url_keyword`、`refresh_window_keyword`、`refresh_window_index`、`refresh_window_tag`
-- 账号策略：`strict_account_isolation`、`fallback_to_other_accounts`
-- 验证码服务共用配置：`captcha_*`（供 `captcha_server.py --config` 读取）
 
 ## 启动顺序
+
+## 安装
+
+```bash
+cd 微博h5
+python3 -m pip install -r requirements.txt
+```
 
 ### 1) 启动验证码后端
 
@@ -72,39 +58,18 @@ python3 captcha_server.py --config ./run_config.json
 curl http://127.0.0.1:5050/health
 ```
 
-### 2) 安装并启用 Chrome 扩展
-
-- 打开 `chrome://extensions/`
-- 开启开发者模式
-- 加载已解压扩展：`微博h5/extension`
-
-### 3) 启动爬虫（单进程）
+### 2) 启动爬虫（单进程）
 
 ```bash
 python3 weibo_bulk_api.py --config ./run_config.json
 ```
 
-## 分片并行（多进程）
 
 
-```bash
-python3 weibo_bulk_api.py --config ./run_config.json --shard-index 0 --shard-total 4 --output ./output/weibo_bulk_result.p0.jsonl --state-db ./output/weibo_bulk_state.p0.db > ./output/weibo_bulk_worker0.log 2>&1 &
-python3 weibo_bulk_api.py --config ./run_config.json --shard-index 1 --shard-total 4 --output ./output/weibo_bulk_result.p1.jsonl --state-db ./output/weibo_bulk_state.p1.db > ./output/weibo_bulk_worker1.log 2>&1 &
-python3 weibo_bulk_api.py --config ./run_config.json --shard-index 2 --shard-total 4 --output ./output/weibo_bulk_result.p2.jsonl --state-db ./output/weibo_bulk_state.p2.db > ./output/weibo_bulk_worker2.log 2>&1 &
-python3 weibo_bulk_api.py --config ./run_config.json --shard-index 3 --shard-total 4 --output ./output/weibo_bulk_result.p3.jsonl --state-db ./output/weibo_bulk_state.p3.db > ./output/weibo_bulk_worker3.log 2>&1 &
-```
 
-查看进程：
 
-```bash
-ps aux | rg "weibo_bulk_api.py.*--shard-index" | rg -v rg
-```
 
-停止分片：
 
-```bash
-pkill -f "weibo_bulk_api.py --config ./run_config.json --shard-index"
-```
 
 ## 输出与续跑
 

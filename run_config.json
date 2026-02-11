@@ -28,7 +28,8 @@
   "captcha_host": "127.0.0.1",
   "captcha_port": 5050,
   "captcha_timeout": 15,
-  "captcha_x_offset": 0,
+  "captcha_x_offset": 4,
+  "captcha_distance_offset_px": 25,
   "captcha_low_confidence_threshold": 0.62,
   "captcha_consistency_tolerance": 5,
   "captcha_debug": false
