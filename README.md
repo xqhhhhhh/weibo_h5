@@ -34,6 +34,34 @@
 后端只能识别两张图片之间的距离差，然后传给前端，但前端本身的像素点偏移需要进行调试
 通过"captcha_distance_offset_px": 25 这个参数进行调试
 
+## API可配置抓取
+
+`weibo_bulk_api.py` 支持通过 `run_config.json` 配置要抓取的 API，而不是写死在代码里。
+
+```json
+{
+  "api_endpoints": ["media", "contributors"],
+  "query_templates": ["#{keyword}#", "{keyword}"]
+}
+```
+
+- `api_endpoints`：
+  - 支持内置名称：`media`、`contributors`
+  - 也支持对象数组（适合扩展新接口）：
+```json
+[
+  {
+    "name": "my_endpoint",
+    "containerid_template": "100103type=164&q={q}",
+    "parser": "users_basic",
+    "output_field": "my_users",
+    "max_pages": 5
+  }
+]
+```
+- `query_templates`：关键词变体模板，`{keyword}` 会被替换为当前关键词。
+- `parser` 当前支持：`users_basic`、`contributors`、`raw_cards`。
+
 
 
 ## 启动顺序
@@ -92,4 +120,3 @@ python3 weibo_bulk_api.py --config ./run_config.json
 - `strict_account_isolation=true` 时，会自动关闭跨账号回退（等价于不启用 `fallback_to_other_accounts`）。
 - 多进程时必须给每个分片使用不同的 `output` 与 `state_db`，避免写冲突。
 - `refresh_window_tag` 依赖 AppleScript 执行页面 JS；若 Chrome 没开该权限会触发降级逻辑（仅 URL 检测）。
-

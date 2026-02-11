@@ -14,7 +14,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
@@ -50,8 +50,36 @@ class Account:
     refresh_window_tag: str
 
 
+@dataclass(frozen=True)
+class ApiEndpoint:
+    name: str
+    containerid_template: str
+    parser: str
+    output_field: str
+    max_pages: int
+    total_field: str = ""
+
+
 class RiskControlBlockedError(RuntimeError):
     """请求被平台风控拦截（如 ok/errno=-100）。"""
+
+
+BUILTIN_API_ENDPOINTS: Dict[str, Dict[str, str]] = {
+    "media": {
+        "containerid_template": "100103type=164&q={q}&t=3",
+        "parser": "users_basic",
+        "output_field": "publish_media_list",
+        "total_field": "media_publish_count",
+    },
+    "contributors": {
+        "containerid_template": "231522type=103&q={q}",
+        "parser": "contributors",
+        "output_field": "top_contributors",
+        "total_field": "",
+    },
+}
+
+SUPPORTED_ENDPOINT_PARSERS = {"users_basic", "contributors", "raw_cards"}
 
 
 def build_browser_like_headers(account: "Account") -> Dict[str, str]:
@@ -171,6 +199,19 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--max-media-pages", type=int, default=12)
         p.add_argument("--max-contrib-pages", type=int, default=3)
         p.add_argument("--allow-empty-contrib", action="store_true", help="贡献榜为空也算成功")
+        p.add_argument(
+            "--api-endpoints",
+            default=None,
+            help=(
+                "接口抓取配置。支持逗号分隔的内置名称(如 media,contributors)，"
+                "或 JSON 数组（字符串或对象）"
+            ),
+        )
+        p.add_argument(
+            "--query-templates",
+            default=None,
+            help="关键词变体模板。支持逗号分隔或 JSON 数组，模板中可使用 {keyword}",
+        )
         p.add_argument("--limit", type=int, default=0, help="仅调试前N个关键词")
         p.add_argument("--refresh-on-not-found", action="store_true", help="命中 found=false 时暂停并刷新本地 Chrome")
         p.add_argument(
@@ -794,25 +835,150 @@ def encode_query(raw_query: str) -> str:
     return quote(raw_query, safe="")
 
 
-def build_media_api(raw_query: str, page: int) -> str:
-    q = encode_query(raw_query)
-    containerid = quote(f"100103type=164&q={q}&t=3", safe="")
-    return f"https://m.weibo.cn/api/container/getIndex?containerid={containerid}&page={page}"
+def _parse_list_config(value: Any, field_name: str) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return []
+        if s.startswith("[") or s.startswith("{"):
+            try:
+                parsed = json.loads(s)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"{field_name} JSON 解析失败: {e}") from e
+            if isinstance(parsed, list):
+                return parsed
+            return [parsed]
+        return [x.strip() for x in s.split(",") if x.strip()]
+    raise ValueError(f"{field_name} 必须是 list/tuple/str，当前={type(value).__name__}")
 
 
-def build_contrib_api(raw_query: str, page: int) -> str:
-    q = encode_query(raw_query)
-    containerid = quote(f"231522type=103&q={q}", safe="")
-    return f"https://m.weibo.cn/api/container/getIndex?containerid={containerid}&page={page}"
+def _default_max_pages_for_endpoint(name: str, args: argparse.Namespace) -> int:
+    if name == "media":
+        return int(args.max_media_pages)
+    if name == "contributors":
+        return int(args.max_contrib_pages)
+    return 1
 
 
-def build_query_variants(keyword: str) -> List[str]:
+def _normalize_endpoint_from_name(name: str, args: argparse.Namespace) -> ApiEndpoint:
+    k = str(name or "").strip().lower()
+    base = BUILTIN_API_ENDPOINTS.get(k)
+    if not base:
+        raise ValueError(f"未知内置 endpoint: {name}")
+    parser = str(base["parser"]).strip().lower()
+    if parser not in SUPPORTED_ENDPOINT_PARSERS:
+        raise ValueError(f"内置 endpoint parser 不支持: {parser}")
+    return ApiEndpoint(
+        name=k,
+        containerid_template=str(base["containerid_template"]),
+        parser=parser,
+        output_field=str(base["output_field"]),
+        max_pages=max(1, _default_max_pages_for_endpoint(k, args)),
+        total_field=str(base.get("total_field") or ""),
+    )
+
+
+def _normalize_endpoint_from_dict(entry: Dict[str, Any], args: argparse.Namespace, idx: int) -> ApiEndpoint:
+    name = str(entry.get("name") or entry.get("builtin") or "").strip().lower()
+    base = BUILTIN_API_ENDPOINTS.get(name, {})
+    containerid_template = str(entry.get("containerid_template") or entry.get("containerid") or base.get("containerid_template") or "").strip()
+    parser = str(entry.get("parser") or base.get("parser") or "").strip().lower()
+    output_field = str(entry.get("output_field") or base.get("output_field") or "").strip()
+    if "total_field" in entry:
+        total_field = str(entry.get("total_field") or "").strip()
+    else:
+        total_field = str(base.get("total_field") or "").strip()
+
+    raw_max_pages = entry.get("max_pages")
+    if raw_max_pages is None:
+        raw_max_pages = _default_max_pages_for_endpoint(name, args)
+    max_pages = max(1, int(raw_max_pages))
+
+    if not name:
+        name = f"custom_{idx}"
+    if not containerid_template:
+        raise ValueError(f"endpoint[{idx}] 缺少 containerid_template/containerid")
+    if not output_field:
+        raise ValueError(f"endpoint[{idx}] 缺少 output_field")
+    if not parser:
+        raise ValueError(f"endpoint[{idx}] 缺少 parser")
+    if parser not in SUPPORTED_ENDPOINT_PARSERS:
+        raise ValueError(f"endpoint[{idx}] parser 不支持: {parser}")
+    if "{q}" not in containerid_template:
+        raise ValueError(f"endpoint[{idx}] containerid_template 必须包含 '{{q}}'")
+
+    return ApiEndpoint(
+        name=name,
+        containerid_template=containerid_template,
+        parser=parser,
+        output_field=output_field,
+        max_pages=max_pages,
+        total_field=total_field,
+    )
+
+
+def resolve_api_endpoints(args: argparse.Namespace) -> List[ApiEndpoint]:
+    entries = _parse_list_config(getattr(args, "api_endpoints", None), "api_endpoints")
+    if not entries:
+        entries = ["media", "contributors"]
+
+    out: List[ApiEndpoint] = []
+    output_fields = set()
+    for i, entry in enumerate(entries, start=1):
+        if isinstance(entry, str):
+            ep = _normalize_endpoint_from_name(entry, args)
+        elif isinstance(entry, dict):
+            ep = _normalize_endpoint_from_dict(entry, args, i)
+        else:
+            raise ValueError(f"api_endpoints[{i}] 必须是 str 或 object")
+        if ep.output_field in output_fields:
+            raise ValueError(f"api_endpoints output_field 重复: {ep.output_field}")
+        output_fields.add(ep.output_field)
+        out.append(ep)
+    return out
+
+
+def resolve_query_templates(args: argparse.Namespace) -> List[str]:
+    entries = _parse_list_config(getattr(args, "query_templates", None), "query_templates")
+    if not entries:
+        entries = ["#{keyword}#", "{keyword}"]
+
     out: List[str] = []
-    for q in (f"#{keyword}#", keyword):
-        q = q.strip()
+    seen = set()
+    for i, x in enumerate(entries, start=1):
+        if not isinstance(x, str):
+            raise ValueError(f"query_templates[{i}] 必须是字符串")
+        t = x.strip()
+        if not t:
+            continue
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    if not out:
+        raise ValueError("query_templates 不能为空")
+    return out
+
+
+def build_query_variants(keyword: str, templates: List[str]) -> List[str]:
+    out: List[str] = []
+    for tpl in templates:
+        q = tpl.replace("{keyword}", keyword).strip()
         if q and q not in out:
             out.append(q)
     return out
+
+
+def build_endpoint_api(raw_query: str, page: int, containerid_template: str) -> str:
+    q = encode_query(raw_query)
+    containerid_raw = containerid_template.format(q=q, query=q, keyword=raw_query)
+    containerid = quote(containerid_raw, safe="")
+    return f"https://m.weibo.cn/api/container/getIndex?containerid={containerid}&page={page}"
 
 
 def parse_card_group_users(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -845,12 +1011,49 @@ def parse_card_group_users(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return users
 
 
-async def fetch_media_list(cli: AccountClient, raw_query: str, max_pages: int) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-    all_users: List[Dict[str, Any]] = []
-    seen = set()
+def parse_number_from_text(text: str) -> Any:
+    s = str(text or "")
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)", s)
+    if not m:
+        return None
+    try:
+        f = float(m.group(1))
+        return int(f) if f.is_integer() else f
+    except Exception:  # noqa: BLE001
+        return m.group(1)
+
+
+def map_user_basic(user: Dict[str, Any], _: int) -> Dict[str, Any]:
+    return {
+        "uid": str(user.get("uid") or ""),
+        "screen_name": str(user.get("screen_name") or ""),
+    }
+
+
+def map_user_contributor(user: Dict[str, Any], rank: int) -> Dict[str, Any]:
+    return {
+        "rank": rank,
+        "uid": str(user.get("uid") or ""),
+        "name": str(user.get("screen_name") or ""),
+        "contribution_value": parse_number_from_text(str(user.get("desc1") or "")),
+    }
+
+
+USER_MAPPERS: Dict[str, Callable[[Dict[str, Any], int], Dict[str, Any]]] = {
+    "users_basic": map_user_basic,
+    "contributors": map_user_contributor,
+}
+
+
+async def fetch_endpoint_items(cli: AccountClient, raw_query: str, endpoint: ApiEndpoint) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    all_items: List[Dict[str, Any]] = []
+    seen_uids = set()
     total = None
-    for p in range(1, max_pages + 1):
-        payload = await cli.get_json(build_media_api(raw_query, p))
+    mapper = USER_MAPPERS.get(endpoint.parser)
+    parser_name = endpoint.parser.lower()
+
+    for p in range(1, endpoint.max_pages + 1):
+        payload = await cli.get_json(build_endpoint_api(raw_query, p, endpoint.containerid_template))
         data = payload.get("data") if isinstance(payload, dict) else {}
         if not isinstance(data, dict):
             break
@@ -858,62 +1061,49 @@ async def fetch_media_list(cli: AccountClient, raw_query: str, max_pages: int) -
         if isinstance(info.get("total"), int):
             total = int(info["total"])
         cards = data.get("cards") if isinstance(data.get("cards"), list) else []
-        users = parse_card_group_users(cards)
 
         got = 0
-        for u in users:
-            uid = str(u.get("uid") or "")
-            if uid in seen:
-                continue
-            seen.add(uid)
-            all_users.append({"uid": uid, "screen_name": str(u.get("screen_name") or "")})
-            got += 1
+        if parser_name == "raw_cards":
+            for card in cards:
+                if not isinstance(card, dict):
+                    continue
+                all_items.append(card)
+                got += 1
+        else:
+            if mapper is None:
+                raise ValueError(f"endpoint parser 不支持: {endpoint.parser}")
+            users = parse_card_group_users(cards)
+            for user in users:
+                uid = str(user.get("uid") or "")
+                if not uid or uid in seen_uids:
+                    continue
+                seen_uids.add(uid)
+                all_items.append(mapper(user, len(all_items) + 1))
+                got += 1
         if got == 0:
             break
-    return all_users, total
+    return all_items, total
 
 
-async def fetch_contributors(cli: AccountClient, raw_query: str, max_pages: int) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    seen = set()
-    for p in range(1, max_pages + 1):
-        payload = await cli.get_json(build_contrib_api(raw_query, p))
-        data = payload.get("data") if isinstance(payload, dict) else {}
-        if not isinstance(data, dict):
-            break
-        cards = data.get("cards") if isinstance(data.get("cards"), list) else []
-        users = parse_card_group_users(cards)
-
-        got = 0
-        for u in users:
-            uid = str(u.get("uid") or "")
-            if uid in seen:
-                continue
-            seen.add(uid)
-            desc1 = str(u.get("desc1") or "")
-            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", desc1)
-            val: Any = None
-            if m:
-                try:
-                    f = float(m.group(1))
-                    val = int(f) if f.is_integer() else f
-                except Exception:
-                    val = m.group(1)
-            out.append(
-                {
-                    "rank": len(out) + 1,
-                    "uid": uid,
-                    "name": str(u.get("screen_name") or ""),
-                    "contribution_value": val,
-                }
-            )
-            got += 1
-        if got == 0:
-            break
-    return out
+def extract_host(result_payload: Dict[str, Any]) -> str:
+    media = result_payload.get("publish_media_list")
+    if isinstance(media, list) and media and isinstance(media[0], dict):
+        return str(media[0].get("screen_name") or media[0].get("name") or "")
+    for v in result_payload.values():
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            host = str(v[0].get("screen_name") or v[0].get("name") or "")
+            if host:
+                return host
+    return ""
 
 
-async def process_keyword(keyword: str, clients: List[AccountClient], args: argparse.Namespace) -> Dict[str, Any]:
+async def process_keyword(
+    keyword: str,
+    clients: List[AccountClient],
+    args: argparse.Namespace,
+    endpoints: List[ApiEndpoint],
+    query_templates: List[str],
+) -> Dict[str, Any]:
     idx = int(hashlib.md5(keyword.encode("utf-8")).hexdigest(), 16) % len(clients)
     order = [clients[(idx + i) % len(clients)] for i in range(len(clients))]
     strict_mode = bool(getattr(args, "strict_account_isolation", False))
@@ -927,31 +1117,44 @@ async def process_keyword(keyword: str, clients: List[AccountClient], args: argp
     for attempt in range(1, args.max_retries + 1):
         for cli in active_order:
             try:
-                variants = build_query_variants(keyword)
+                variants = build_query_variants(keyword, query_templates)
                 for i, raw_query in enumerate(variants):
                     is_last_variant = i == len(variants) - 1
                     try:
-                        media_list, media_total = await fetch_media_list(cli, raw_query, args.max_media_pages)
-                        contrib_list = await fetch_contributors(cli, raw_query, args.max_contrib_pages)
+                        endpoint_payload: Dict[str, Any] = {}
+                        for endpoint in endpoints:
+                            items, total = await fetch_endpoint_items(cli, raw_query, endpoint)
+                            endpoint_payload[endpoint.output_field] = items
+                            if endpoint.total_field:
+                                endpoint_payload[endpoint.total_field] = total if isinstance(total, int) else None
                     except Exception:
                         if not is_last_variant:
                             continue
                         raise
 
-                    host = str(media_list[0].get("screen_name") or "") if media_list else ""
-                    found = bool(media_list or contrib_list)
-                    if (not contrib_list) and (not args.allow_empty_contrib):
+                    default_payload: Dict[str, Any] = {
+                        "media_publish_count": None,
+                        "host": "",
+                        "publish_media_list": [],
+                        "top_contributors": [],
+                    }
+                    default_payload.update(endpoint_payload)
+
+                    contrib_list = default_payload.get("top_contributors")
+                    if contrib_list is None:
+                        contrib_list = []
+                    has_contrib_endpoint = any(ep.output_field == "top_contributors" for ep in endpoints)
+                    found = any(bool(default_payload.get(endpoint.output_field)) for endpoint in endpoints)
+                    if has_contrib_endpoint and (not contrib_list) and (not args.allow_empty_contrib):
                         if not is_last_variant:
                             continue
                         raise RuntimeError("contributors empty")
+                    default_payload["host"] = extract_host(default_payload)
 
                     return {
                         "keyword": keyword,
                         "found": found,
-                        "media_publish_count": media_total if isinstance(media_total, int) else None,
-                        "host": host,
-                        "publish_media_list": media_list,
-                        "top_contributors": contrib_list,
+                        **default_payload,
                         "_account": cli.account.name,
                         "_ok": True,
                         "_error": "",
@@ -989,6 +1192,8 @@ async def main_async(args: argparse.Namespace) -> int:
         int(args.shard_index),
         int(args.shard_total),
     )
+    api_endpoints = resolve_api_endpoints(args)
+    query_templates = resolve_query_templates(args)
     accounts = load_accounts(accounts_path, args.per_account_qps)
     raw_log_path = Path(args.raw_log).expanduser() if str(args.raw_log).strip() else None
     clients = [AccountClient(a, timeout=args.timeout, raw_log_path=raw_log_path) for a in accounts]
@@ -1009,7 +1214,8 @@ async def main_async(args: argparse.Namespace) -> int:
         "[INFO] "
         f"keywords={len(keywords)} done={len(initial_done)} todo={len(keywords) - len(initial_done)} accounts={len(accounts)} "
         f"mode={mode} shard={shard_desc} "
-        f"strict_account_isolation={strict_mode} fallback_to_other_accounts={fallback_mode}"
+        f"strict_account_isolation={strict_mode} fallback_to_other_accounts={fallback_mode} "
+        f"endpoints={[e.name for e in api_endpoints]} query_templates={query_templates}"
     )
 
     output_path = Path(args.output)
@@ -1031,14 +1237,14 @@ async def main_async(args: argparse.Namespace) -> int:
         return lk
 
     async def run_one_keyword(kw: str) -> None:
-        result = await process_keyword(kw, clients, args)
+        result = await process_keyword(kw, clients, args, api_endpoints, query_templates)
         if args.refresh_on_not_found and (result.get("found") is False):
             acc_name = str(result.get("_account") or "")
             acc_obj = account_by_name.get(acc_name) if acc_name else None
             await handle_not_found_gate(args, kw, acc_obj, gate_lock_for_account(acc_obj))
             if bool(getattr(args, "retry_false_after_verify", True)):
                 print(f"[INFO] account={acc_name or '-'} keyword={kw} retry once after verify gate")
-                retry_result = await process_keyword(kw, clients, args)
+                retry_result = await process_keyword(kw, clients, args, api_endpoints, query_templates)
                 # 二次结果作为最终写入结果（无论是否变为 true）。
                 result = retry_result
         async with persist_lock:

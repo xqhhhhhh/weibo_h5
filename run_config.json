@@ -13,6 +13,8 @@
   "max_retries": 3,
   "max_media_pages": 12,
   "max_contrib_pages": 3,
+  "api_endpoints": ["media", "contributors"],
+  "query_templates": ["#{keyword}#", "{keyword}"],
   "allow_empty_contrib": true,
   "limit": 0,
   "refresh_on_not_found": true,
