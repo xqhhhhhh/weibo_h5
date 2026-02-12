@@ -82,6 +82,57 @@ BUILTIN_API_ENDPOINTS: Dict[str, Dict[str, str]] = {
 SUPPORTED_ENDPOINT_PARSERS = {"users_basic", "contributors", "raw_cards"}
 
 
+def _platform_from_ua(ua: str) -> str:
+    s = str(ua or "")
+    if "Android" in s:
+        return "Android"
+    if "iPhone" in s or "iPad" in s:
+        return "iOS"
+    if "Mac OS X" in s:
+        return "macOS"
+    if "Windows" in s:
+        return "Windows"
+    return "Linux"
+
+
+def _is_mobile_ua(ua: str) -> bool:
+    s = str(ua or "")
+    return ("Mobile" in s) or ("Android" in s) or ("iPhone" in s) or ("iPad" in s)
+
+
+def _extract_chrome_version(ua: str) -> Tuple[str, str]:
+    m = re.search(r"Chrome/(\d+)(\.[0-9.]+)?", str(ua or ""))
+    if not m:
+        return "121", "121.0.0.0"
+    major = str(m.group(1))
+    full = f"{major}{str(m.group(2) or '.0.0.0')}"
+    return major, full
+
+
+def _is_chromium_ua(ua: str) -> bool:
+    s = str(ua or "")
+    return ("Chrome/" in s) and ("Edg/" not in s) and ("OPR/" not in s) and ("CriOS/" not in s)
+
+
+def _build_chromium_client_hints(ua: str) -> Dict[str, str]:
+    major, _ = _extract_chrome_version(ua)
+    platform = _platform_from_ua(ua)
+    mobile = "?1" if _is_mobile_ua(ua) else "?0"
+    return {
+        "sec-ch-ua": f'"Not.A/Brand";v="99", "Chromium";v="{major}", "Google Chrome";v="{major}"',
+        "sec-ch-ua-mobile": mobile,
+        "sec-ch-ua-platform": f'"{platform}"',
+    }
+
+
+def _origin_from_referer(referer: str) -> str:
+    s = str(referer or "").strip()
+    m = re.match(r"^(https?://[^/]+)", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return "https://m.weibo.cn"
+
+
 def build_browser_like_headers(account: "Account") -> Dict[str, str]:
     ua = account.user_agent
     headers: Dict[str, str] = {
@@ -90,7 +141,7 @@ def build_browser_like_headers(account: "Account") -> Dict[str, str]:
         "Accept-Language": account.accept_language,
         "Accept-Encoding": "gzip, deflate, br",
         "Referer": account.referer,
-        "Origin": "https://m.weibo.cn",
+        "Origin": _origin_from_referer(account.referer),
         "Connection": "keep-alive",
         "Pragma": "no-cache",
         "Cache-Control": "no-cache",
@@ -99,15 +150,10 @@ def build_browser_like_headers(account: "Account") -> Dict[str, str]:
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Dest": "empty",
     }
-    # 仅 Chromium UA 附带 client hints，避免 UA 与请求头不一致
-    if "Chrome/" in ua:
-        headers.update(
-            {
-                "sec-ch-ua": '"Google Chrome";v="121", "Chromium";v="121", "Not=A?Brand";v="99"',
-                "sec-ch-ua-mobile": "?1",
-                "sec-ch-ua-platform": '"Android"',
-            }
-        )
+    # 仅 Chromium UA 附带 client hints，避免 UA 与请求头不一致（Safari 不带 sec-ch-*）
+    if _is_chromium_ua(ua):
+        headers.update(_build_chromium_client_hints(ua))
+        headers["Priority"] = "u=1, i"
     return headers
 
 
